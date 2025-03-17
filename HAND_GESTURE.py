@@ -1,160 +1,118 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[8]:
-
-
 import cv2
 import mediapipe as mp
 import numpy as np
+import psutil
 import pyautogui
 import time
-import math
-import psutil
-from deepface import DeepFace
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+import os
+import win32gui
+import win32con
+import win32api
+import webbrowser
+import ctypes
 
-# Initialize Hand and Face Detection
+# Setup for webcam and hand tracking
+wCam, hCam = 640, 480
+cap = cv2.VideoCapture(0)  # Set to 0 for Windows default camera
+cap.set(3, wCam)
+cap.set(4, hCam)
+
+# Initialize Face Detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+AUTHORIZED_FACE = "authorized_face.jpg"
+locked = True  # Lock state
+
+# Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
-face_detection = mp_face_detection.FaceDetection(min_detection_confidence=0.7)
+hands = mp_hands.Hands(min_detection_confidence=0.9, min_tracking_confidence=0.9)
+mpDraw = mp.solutions.drawing_utils
 
-# Setup Camera
-cap = cv2.VideoCapture(0)  # Try changing index (0, 1, 2) if camera isn't detected
-pyautogui.FAILSAFE = False
+def set_window_on_top(window_name):
+    hwnd = win32gui.FindWindow(None, window_name)
+    if hwnd:
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 640, 480, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
 
-# Get Audio Control for Windows
-devices = AudioUtilities.GetSpeakers()
-interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-volume = cast(interface, POINTER(IAudioEndpointVolume))
+def register_face(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    if len(faces) > 0:
+        x, y, w, h = faces[0]
+        cv2.imwrite(AUTHORIZED_FACE, gray[y:y+h, x:x+w])
+        return True
+    return False
 
-# Store Authorized Users
-authorized_users = ["User1", "User2"]
-current_user = None
-drawing = np.zeros((480, 640, 3), dtype=np.uint8)
-previous_index_tip = None
-start_time = None
+def authenticate_user(frame):
+    if not os.path.exists(AUTHORIZED_FACE):
+        return False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    return len(faces) > 0
 
-def set_volume(volume_level):
-    """Set Windows volume level (0.0 to 1.0 scale)"""
-    volume_level = max(0, min(1, volume_level))  # Ensure range
-    volume.SetMasterVolumeLevelScalar(volume_level, None)
+def is_media_playing():
+    media_processes = ["vlc.exe", "chrome.exe", "msedge.exe", "firefox.exe", "wmplayer.exe"]
+    return any(proc.info['name'] in media_processes for proc in psutil.process_iter(attrs=['name']))
 
-def detect_face(frame):
-    """Detect face from video frame"""
-    results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    if results.detections:
-        for detection in results.detections:
-            bboxC = detection.location_data.relative_bounding_box
-            h, w, _ = frame.shape
-            x, y, w_box, h_box = int(bboxC.xmin * w), int(bboxC.ymin * h), int(bboxC.width * w), int(bboxC.height * h)
-            return frame[y:y+h_box, x:x+w_box]
-    return None
+def detect_gesture(results, frame):
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mpDraw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            landmarks = [(lm.x, lm.y) for lm in hand_landmarks.landmark]
+            index_tip = landmarks[8]
+            wrist = landmarks[0]
+            thumb_tip = landmarks[4]
+            middle_tip = landmarks[12]
+            pinky_tip = landmarks[20]
 
-def authenticate_user(face_img):
-    """Identify user via face recognition"""
-    global current_user
-    try:
-        analysis = DeepFace.find(face_img, db_path="./face_db", enforce_detection=False)
-        if analysis and len(analysis[0]) > 0:
-            recognized_user = analysis[0]['identity'][0].split('/')[-1].split('.')[0]
-            if recognized_user in authorized_users:
-                current_user = recognized_user
-                return recognized_user
-    except:
-        pass
-    return "Unauthorized"
-
-def recognize_shape():
-    """Detect shapes drawn in the air"""
-    global drawing
-    gray = cv2.cvtColor(drawing, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for contour in contours:
-        approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
-        if len(approx) == 3:
-            return "Y"  # YouTube
-        elif len(approx) == 4:
-            return "L"  # Child Lock
-        elif len(approx) > 6:
-            return "U"  # Unlock
+            if index_tip[1] < wrist[1] and abs(index_tip[0] - wrist[0]) < 0.1:
+                return "O"
+            
+            # Detect 'Y' shape (Index and Pinky extended)
+            if index_tip[1] < wrist[1] and pinky_tip[1] < wrist[1] and middle_tip[1] > wrist[1]:
+                return "Y"
+            
+            # Detect 'L' shape (Index and Thumb extended)
+            if index_tip[1] < wrist[1] and thumb_tip[0] < wrist[0] and middle_tip[1] > wrist[1]:
+                return "L"
     return None
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
-        print("Error: Camera not detected!")
         break
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    hand_results = hands.process(rgb_frame)
-    face_img = detect_face(frame)
-
-    # Process Hand Gestures
-    if hand_results.multi_hand_landmarks:
-        for hand_landmarks in hand_results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            index_tip = hand_landmarks.landmark[8]
-            h, w, _ = frame.shape
-            x, y = int(index_tip.x * w), int(index_tip.y * h)
-
-            if previous_index_tip:
-                cv2.line(drawing, previous_index_tip, (x, y), (0, 255, 0), 2)
-            previous_index_tip = (x, y)
-
-            if start_time is None:
-                start_time = time.time()
-            elif time.time() - start_time > 3:
-                shape = recognize_shape()
-                if shape:
-                    cv2.putText(frame, f'Command: {shape}', (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-                    if shape == "Y":
-                        print("Launching YouTube")
-                        pyautogui.hotkey('win', '1')  # Open first pinned app (customize as needed)
-                    elif shape == "L":
-                        print("Child Lock Enabled")
-                    elif shape == "U" and current_user:
-                        print("Unlocking TV for", current_user)
-                drawing = np.zeros((480, 640, 3), dtype=np.uint8)
-                start_time = None
-
-    # Face Authentication
-    if face_img is not None:
-        try:
-            analysis = DeepFace.analyze(face_img, actions=['age'], enforce_detection=False)
-            age = analysis[0]['age']
-            user_status = authenticate_user(face_img)
-
-            if user_status == "Unauthorized":
-                cv2.putText(frame, 'Access Denied', (50, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                continue
-
-            cv2.putText(frame, f'User: {user_status}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f'Age: {age}', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            if age < 12:
-                cv2.putText(frame, 'Child Lock Enabled', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        except:
-            pass
-
-    frame = cv2.addWeighted(frame, 1, drawing, 0.5, 0)
-    cv2.imshow('Gesture Control Windows', frame)
-
+    frame = cv2.flip(frame, 1)
+    if not os.path.exists(AUTHORIZED_FACE):
+        register_face(frame)
+    
+    if authenticate_user(frame):
+        locked = False
+    
+    instruction = "Show face to unlock. O=Play/Pause, Y=YouTube, L=Lock"
+    if locked:
+        instruction = "Locked: Show authorized face to unlock."
+    cv2.putText(frame, instruction, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255) if locked else (0, 255, 0), 2)
+    
+    if not locked:
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        gesture = detect_gesture(results, frame)
+        if gesture and time.time() - last_action_time > 1:
+            if gesture == "O":
+                pyautogui.press("space")
+            elif gesture == "Y":
+                webbrowser.open("https://www.youtube.com")
+            elif gesture == "L":
+                ctypes.windll.user32.LockWorkStation()
+                locked = True
+            last_action_time = time.time()
+    
+    small_frame = cv2.resize(frame, (320, 240))
+    screen = np.zeros((hCam, wCam, 3), dtype=np.uint8)
+    screen[:240, -320:] = small_frame
+    cv2.imshow("Gesture Control", screen)
+    set_window_on_top("Gesture Control")
+    
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-
-
-# In[ ]:
-
-
-
-
