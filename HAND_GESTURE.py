@@ -13,9 +13,13 @@ import ctypes
 
 # Setup for webcam and hand tracking
 wCam, hCam = 640, 480
-cap = cv2.VideoCapture(0)  # Set to 0 for Windows default camera
+cap = cv2.VideoCapture(0)  # Change to 1 if using an external camera
 cap.set(3, wCam)
 cap.set(4, hCam)
+
+if not cap.isOpened():
+    print("Error: Could not open webcam.")
+    exit()
 
 # Initialize Face Detection
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -24,8 +28,11 @@ locked = True  # Lock state
 
 # Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(min_detection_confidence=0.9, min_tracking_confidence=0.9)
+hands = mp_hands.Hands(min_detection_confidence=0.97, min_tracking_confidence=0.97)
 mpDraw = mp.solutions.drawing_utils
+
+# Initialize cooldown timer
+last_action_time = time.time()
 
 def set_window_on_top(window_name):
     hwnd = win32gui.FindWindow(None, window_name)
@@ -38,6 +45,7 @@ def register_face(frame):
     if len(faces) > 0:
         x, y, w, h = faces[0]
         cv2.imwrite(AUTHORIZED_FACE, gray[y:y+h, x:x+w])
+        print("Face registered.")
         return True
     return False
 
@@ -63,17 +71,26 @@ def detect_gesture(results, frame):
             middle_tip = landmarks[12]
             pinky_tip = landmarks[20]
 
-            if index_tip[1] < wrist[1] and abs(index_tip[0] - wrist[0]) < 0.1:
+            # Strict gesture detection
+            if index_tip[1] < wrist[1] and abs(index_tip[0] - wrist[0]) < 0.03:
                 return "O"
             
-            # Detect 'Y' shape (Index and Pinky extended)
             if index_tip[1] < wrist[1] and pinky_tip[1] < wrist[1] and middle_tip[1] > wrist[1]:
                 return "Y"
             
-            # Detect 'L' shape (Index and Thumb extended)
             if index_tip[1] < wrist[1] and thumb_tip[0] < wrist[0] and middle_tip[1] > wrist[1]:
                 return "L"
     return None
+
+# Ensure face registration before starting
+while not os.path.exists(AUTHORIZED_FACE):
+    print("Registering face... Look at the camera.")
+    ret, frame = cap.read()
+    if ret:
+        register_face(frame)
+    time.sleep(2)
+
+time.sleep(2)
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -81,9 +98,6 @@ while cap.isOpened():
         break
 
     frame = cv2.flip(frame, 1)
-    if not os.path.exists(AUTHORIZED_FACE):
-        register_face(frame)
-    
     if authenticate_user(frame):
         locked = False
     
